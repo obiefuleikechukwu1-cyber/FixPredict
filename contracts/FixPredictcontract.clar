@@ -147,8 +147,8 @@
         equipment-type: equipment-type,
         location: location,
         iot-sensor-id: iot-sensor-id,
-        registration-block: block-height,
-        last-maintenance: block-height,
+        registration-block: u0,
+        last-maintenance: u0,
         is-active: true,
         total-downtime: u0
       }
@@ -172,7 +172,7 @@
       { provider: tx-sender }
       {
         company-name: company-name,
-        registration-block: block-height,
+        registration-block: u0,
         total-contracts: u0,
         successful-predictions: u0,
         failed-predictions: u0,
@@ -194,15 +194,15 @@
     (contract-id (var-get next-contract-id))
     (equipment-info (unwrap! (map-get? equipment-registry { equipment-id: equipment-id }) err-not-found))
     (provider-profile (unwrap! (map-get? provider-profiles { provider: tx-sender }) err-unauthorized))
-    (prediction-window-end (+ block-height max-prediction-window))
+    (prediction-window-end (+ u0 max-prediction-window))
     (insurance-fee (/ (* contract-value insurance-fee-rate) u100))
     (platform-fee (/ (* contract-value platform-fee-rate) u100))
     (total-required (+ stake-amount insurance-fee platform-fee))
   )
     (asserts! (get is-active equipment-info) err-invalid-input)
     (asserts! (>= stake-amount min-stake-amount) err-invalid-stake)
-    (asserts! (> predicted-failure-block block-height) err-invalid-input)
-    (asserts! (<= predicted-failure-block (+ block-height u10080)) err-invalid-input) ;; Max 1 week ahead
+    (asserts! (> predicted-failure-block u0) err-invalid-input)
+    (asserts! (<= predicted-failure-block (+ u0 u10080)) err-invalid-input) ;; Max 1 week ahead
     (asserts! (>= (ft-get-balance fix-token tx-sender) total-required) err-insufficient-funds)
     
     ;; Transfer tokens for stake, insurance, and platform fee
@@ -222,12 +222,12 @@
         equipment-id: equipment-id,
         service-provider: tx-sender,
         predicted-failure-block: predicted-failure-block,
-        prediction-window-start: block-height,
+        prediction-window-start: u0,
         prediction-window-end: prediction-window-end,
         stake-amount: stake-amount,
         contract-value: contract-value,
         status: "active",
-        created-block: block-height,
+        created-block: u0,
         insurance-coverage: true,
         accuracy-score: u0
       }
@@ -272,8 +272,8 @@
     (asserts! (is-eq tx-sender (get owner equipment-info)) err-unauthorized)
     
     ;; Check if we're within validation window
-    (asserts! (>= block-height (get prediction-window-start contract-info)) err-prediction-window-closed)
-    (asserts! (<= block-height (get prediction-window-end contract-info)) err-prediction-window-closed)
+    (asserts! (>= u0 (get prediction-window-start contract-info)) err-prediction-window-closed)
+    (asserts! (<= u0 (get prediction-window-end contract-info)) err-prediction-window-closed)
     
     ;; Check if contract is still active
     (asserts! (is-eq (get status contract-info) "active") err-contract-expired)
@@ -299,7 +299,7 @@
         (map-set equipment-registry
           { equipment-id: (get equipment-id contract-info) }
           (merge equipment-info {
-            last-maintenance: block-height
+            last-maintenance: u0
           })
         )
         
@@ -308,7 +308,7 @@
           { provider: provider }
           (merge provider-profile {
             successful-predictions: (+ (get successful-predictions provider-profile) u1),
-            reputation-score: (min u100 (+ (get reputation-score provider-profile) u5))
+            reputation-score: (if (> (+ (get reputation-score provider-profile) u5) u100) u100 (+ (get reputation-score provider-profile) u5))
           })
         )
         
@@ -330,7 +330,7 @@
           { provider: provider }
           (merge provider-profile {
             failed-predictions: (+ (get failed-predictions provider-profile) u1),
-            reputation-score: (max u0 (- (get reputation-score provider-profile) u10))
+            reputation-score: (if (< (- (get reputation-score provider-profile) u10) u0) u0 (- (get reputation-score provider-profile) u10))
           })
         )
         
@@ -372,7 +372,7 @@
         claimant: tx-sender,
         claim-reason: claim-reason,
         claim-status: "pending",
-        claim-block: block-height,
+        claim-block: u0,
         resolution-block: none
       }
     )
@@ -410,7 +410,7 @@
           { contract-id: contract-id }
           (merge claim-info {
             claim-status: "approved",
-            resolution-block: (some block-height)
+            resolution-block: (some u0)
           })
         )
         
@@ -422,7 +422,7 @@
           { contract-id: contract-id }
           (merge claim-info {
             claim-status: "denied",
-            resolution-block: (some block-height)
+            resolution-block: (some u0)
           })
         )
         
@@ -436,5 +436,61 @@
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (ft-mint? fix-token amount recipient)
+  )
+)
+
+
+;; read only functions
+
+(define-read-only (get-equipment-info (equipment-id uint))
+  (map-get? equipment-registry { equipment-id: equipment-id })
+)
+
+(define-read-only (get-contract-info (contract-id uint))
+  (map-get? maintenance-contracts { contract-id: contract-id })
+)
+
+(define-read-only (get-provider-profile (provider principal))
+  (map-get? provider-profiles { provider: provider })
+)
+
+(define-read-only (get-provider-reputation (provider principal))
+  (match (map-get? provider-profiles { provider: provider })
+    profile (ok (get reputation-score profile))
+    err-not-found
+  )
+)
+
+(define-read-only (get-platform-stats)
+  {
+    total-equipment: (var-get total-equipment-registered),
+    total-predictions: (var-get total-predictions-made),
+    insurance-pool-size: (var-get insurance-pool),
+    platform-treasury: (var-get platform-treasury)
+  }
+)
+
+(define-read-only (get-staking-position (contract-id uint) (provider principal))
+  (map-get? staking-positions { contract-id: contract-id, provider: provider })
+)
+
+(define-read-only (get-insurance-claim (contract-id uint))
+  (map-get? insurance-claims { contract-id: contract-id })
+)
+
+(define-read-only (calculate-insurance-premium (contract-value uint))
+  (/ (* contract-value insurance-fee-rate) u100)
+)
+
+(define-read-only (get-fix-token-balance (user principal))
+  (ft-get-balance fix-token user)
+)
+
+;; private functions
+
+(define-private (calculate-reputation-score (successful uint) (failed uint))
+  (if (is-eq (+ successful failed) u0)
+    u50 ;; Default neutral score
+    (/ (* successful u100) (+ successful failed))
   )
 )
