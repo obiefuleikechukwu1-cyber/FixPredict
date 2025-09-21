@@ -438,3 +438,59 @@
     (ft-mint? fix-token amount recipient)
   )
 )
+
+
+;; read only functions
+
+(define-read-only (get-equipment-info (equipment-id uint))
+  (map-get? equipment-registry { equipment-id: equipment-id })
+)
+
+(define-read-only (get-contract-info (contract-id uint))
+  (map-get? maintenance-contracts { contract-id: contract-id })
+)
+
+(define-read-only (get-provider-profile (provider principal))
+  (map-get? provider-profiles { provider: provider })
+)
+
+(define-read-only (get-provider-reputation (provider principal))
+  (match (map-get? provider-profiles { provider: provider })
+    profile (ok (get reputation-score profile))
+    err-not-found
+  )
+)
+
+(define-read-only (get-platform-stats)
+  {
+    total-equipment: (var-get total-equipment-registered),
+    total-predictions: (var-get total-predictions-made),
+    insurance-pool-size: (var-get insurance-pool),
+    platform-treasury: (var-get platform-treasury)
+  }
+)
+
+(define-read-only (get-staking-position (contract-id uint) (provider principal))
+  (map-get? staking-positions { contract-id: contract-id, provider: provider })
+)
+
+(define-read-only (get-insurance-claim (contract-id uint))
+  (map-get? insurance-claims { contract-id: contract-id })
+)
+
+(define-read-only (calculate-insurance-premium (contract-value uint))
+  (/ (* contract-value insurance-fee-rate) u100)
+)
+
+(define-read-only (get-fix-token-balance (user principal))
+  (ft-get-balance fix-token user)
+)
+
+;; private functions
+
+(define-private (calculate-reputation-score (successful uint) (failed uint))
+  (if (is-eq (+ successful failed) u0)
+    u50 ;; Default neutral score
+    (/ (* successful u100) (+ successful failed))
+  )
+)
