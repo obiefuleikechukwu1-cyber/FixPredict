@@ -32,11 +32,19 @@
 (define-constant err-prediction-window-closed (err u107))
 (define-constant err-maintenance-not-due (err u108))
 (define-constant err-invalid-stake (err u109))
+(define-constant err-contract-paused (err u110))
+(define-constant err-rate-limit-exceeded (err u111))
+(define-constant err-overflow (err u112))
+(define-constant err-underflow (err u113))
 
 (define-constant min-stake-amount u1000)
 (define-constant max-prediction-window u48) ;; 48 hours
 (define-constant insurance-fee-rate u5) ;; 5% of contract value
 (define-constant platform-fee-rate u2) ;; 2% of contract value
+
+;; Rate limiting constants
+(define-constant RATE-LIMIT-BLOCKS u10)
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
 
 ;; data vars
 (define-data-var next-equipment-id uint u1)
@@ -45,6 +53,7 @@
 (define-data-var total-predictions-made uint u0)
 (define-data-var platform-treasury uint u0)
 (define-data-var insurance-pool uint u0)
+(define-data-var contract-paused bool false)
 
 ;; data maps
 (define-map equipment-registry
@@ -126,8 +135,75 @@
   }
 )
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+
+;; Security helper functions
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) err-overflow)
+    (ok result)
+  )
+)
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    err-underflow
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) err-overflow)
+    (ok result)
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block burn-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      err-rate-limit-exceeded
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (validate-string-not-empty (str (string-ascii 200)))
+  (if (> (len str) u0)
+    (ok true)
+    err-invalid-input
+  )
+)
 
 ;; public functions
+
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 (define-public (register-equipment (equipment-type (string-ascii 50)) 
                                  (location (string-ascii 100))
@@ -135,6 +211,9 @@
   (let (
     (equipment-id (var-get next-equipment-id))
   )
+    ;; Security checks
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (try! (check-rate-limit tx-sender))
     (asserts! (> (len equipment-type) u0) err-invalid-input)
     (asserts! (> (len iot-sensor-id) u0) err-invalid-input)
     
@@ -147,15 +226,15 @@
         equipment-type: equipment-type,
         location: location,
         iot-sensor-id: iot-sensor-id,
-        registration-block: u0,
-        last-maintenance: u0,
+        registration-block: burn-block-height,
+        last-maintenance: burn-block-height,
         is-active: true,
         total-downtime: u0
       }
     )
     
-    (var-set next-equipment-id (+ equipment-id u1))
-    (var-set total-equipment-registered (+ (var-get total-equipment-registered) u1))
+    (var-set next-equipment-id (unwrap! (safe-add equipment-id u1) err-overflow))
+    (var-set total-equipment-registered (unwrap! (safe-add (var-get total-equipment-registered) u1) err-overflow))
     
     (ok equipment-id)
   )
@@ -165,6 +244,8 @@
   (let (
     (existing-profile (map-get? provider-profiles { provider: tx-sender }))
   )
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (try! (check-rate-limit tx-sender))
     (asserts! (is-none existing-profile) err-already-exists)
     (asserts! (> (len company-name) u0) err-invalid-input)
     
@@ -172,7 +253,7 @@
       { provider: tx-sender }
       {
         company-name: company-name,
-        registration-block: u0,
+        registration-block: burn-block-height,
         total-contracts: u0,
         successful-predictions: u0,
         failed-predictions: u0,
@@ -194,23 +275,25 @@
     (contract-id (var-get next-contract-id))
     (equipment-info (unwrap! (map-get? equipment-registry { equipment-id: equipment-id }) err-not-found))
     (provider-profile (unwrap! (map-get? provider-profiles { provider: tx-sender }) err-unauthorized))
-    (prediction-window-end (+ u0 max-prediction-window))
-    (insurance-fee (/ (* contract-value insurance-fee-rate) u100))
-    (platform-fee (/ (* contract-value platform-fee-rate) u100))
-    (total-required (+ stake-amount insurance-fee platform-fee))
+    (prediction-window-end (unwrap! (safe-add burn-block-height max-prediction-window) err-overflow))
+    (insurance-fee (/ (unwrap! (safe-mul contract-value insurance-fee-rate) err-overflow) u100))
+    (platform-fee (/ (unwrap! (safe-mul contract-value platform-fee-rate) err-overflow) u100))
+    (total-required (unwrap! (safe-add (unwrap! (safe-add stake-amount insurance-fee) err-overflow) platform-fee) err-overflow))
   )
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (try! (check-rate-limit tx-sender))
     (asserts! (get is-active equipment-info) err-invalid-input)
     (asserts! (>= stake-amount min-stake-amount) err-invalid-stake)
-    (asserts! (> predicted-failure-block u0) err-invalid-input)
-    (asserts! (<= predicted-failure-block (+ u0 u10080)) err-invalid-input) ;; Max 1 week ahead
+    (asserts! (> predicted-failure-block burn-block-height) err-invalid-input)
+    (asserts! (<= predicted-failure-block (unwrap! (safe-add burn-block-height u10080) err-overflow)) err-invalid-input) ;; Max 1 week ahead
     (asserts! (>= (ft-get-balance fix-token tx-sender) total-required) err-insufficient-funds)
     
     ;; Transfer tokens for stake, insurance, and platform fee
     (try! (ft-transfer? fix-token total-required tx-sender (as-contract tx-sender)))
     
     ;; Update insurance pool and platform treasury
-    (var-set insurance-pool (+ (var-get insurance-pool) insurance-fee))
-    (var-set platform-treasury (+ (var-get platform-treasury) platform-fee))
+    (var-set insurance-pool (unwrap! (safe-add (var-get insurance-pool) insurance-fee) err-overflow))
+    (var-set platform-treasury (unwrap! (safe-add (var-get platform-treasury) platform-fee) err-overflow))
     
     ;; Mint maintenance contract NFT
     (try! (nft-mint? maintenance-contract-nft contract-id tx-sender))
@@ -222,12 +305,12 @@
         equipment-id: equipment-id,
         service-provider: tx-sender,
         predicted-failure-block: predicted-failure-block,
-        prediction-window-start: u0,
+        prediction-window-start: burn-block-height,
         prediction-window-end: prediction-window-end,
         stake-amount: stake-amount,
         contract-value: contract-value,
         status: "active",
-        created-block: u0,
+        created-block: burn-block-height,
         insurance-coverage: true,
         accuracy-score: u0
       }
@@ -238,8 +321,8 @@
       { contract-id: contract-id, provider: tx-sender }
       {
         stake-amount: stake-amount,
-        locked-until-block: (+ predicted-failure-block u144), ;; Lock for 24 hours after prediction
-        expected-return: (/ (* stake-amount u110) u100), ;; 10% expected return
+        locked-until-block: (unwrap! (safe-add predicted-failure-block u144) err-overflow), ;; Lock for 24 hours after prediction
+        expected-return: (/ (unwrap! (safe-mul stake-amount u110) err-overflow) u100), ;; 10% expected return
         risk-level: u50
       }
     )
@@ -248,13 +331,13 @@
     (map-set provider-profiles
       { provider: tx-sender }
       (merge provider-profile {
-        total-contracts: (+ (get total-contracts provider-profile) u1),
-        total-staked: (+ (get total-staked provider-profile) stake-amount)
+        total-contracts: (unwrap! (safe-add (get total-contracts provider-profile) u1) err-overflow),
+        total-staked: (unwrap! (safe-add (get total-staked provider-profile) stake-amount) err-overflow)
       })
     )
     
-    (var-set next-contract-id (+ contract-id u1))
-    (var-set total-predictions-made (+ (var-get total-predictions-made) u1))
+    (var-set next-contract-id (unwrap! (safe-add contract-id u1) err-overflow))
+    (var-set total-predictions-made (unwrap! (safe-add (var-get total-predictions-made) u1) err-overflow))
     
     (ok contract-id)
   )
@@ -272,8 +355,8 @@
     (asserts! (is-eq tx-sender (get owner equipment-info)) err-unauthorized)
     
     ;; Check if we're within validation window
-    (asserts! (>= u0 (get prediction-window-start contract-info)) err-prediction-window-closed)
-    (asserts! (<= u0 (get prediction-window-end contract-info)) err-prediction-window-closed)
+    (asserts! (>= burn-block-height (get prediction-window-start contract-info)) err-prediction-window-closed)
+    (asserts! (<= burn-block-height (get prediction-window-end contract-info)) err-prediction-window-closed)
     
     ;; Check if contract is still active
     (asserts! (is-eq (get status contract-info) "active") err-contract-expired)
@@ -299,7 +382,7 @@
         (map-set equipment-registry
           { equipment-id: (get equipment-id contract-info) }
           (merge equipment-info {
-            last-maintenance: u0
+            last-maintenance: burn-block-height
           })
         )
         
@@ -307,8 +390,8 @@
         (map-set provider-profiles
           { provider: provider }
           (merge provider-profile {
-            successful-predictions: (+ (get successful-predictions provider-profile) u1),
-            reputation-score: (if (> (+ (get reputation-score provider-profile) u5) u100) u100 (+ (get reputation-score provider-profile) u5))
+            successful-predictions: (unwrap! (safe-add (get successful-predictions provider-profile) u1) err-overflow),
+            reputation-score: (if (> (unwrap! (safe-add (get reputation-score provider-profile) u5) err-overflow) u100) u100 (unwrap! (safe-add (get reputation-score provider-profile) u5) err-overflow))
           })
         )
         
@@ -329,13 +412,13 @@
         (map-set provider-profiles
           { provider: provider }
           (merge provider-profile {
-            failed-predictions: (+ (get failed-predictions provider-profile) u1),
-            reputation-score: (if (< (- (get reputation-score provider-profile) u10) u0) u0 (- (get reputation-score provider-profile) u10))
+            failed-predictions: (unwrap! (safe-add (get failed-predictions provider-profile) u1) err-overflow),
+            reputation-score: (if (< (get reputation-score provider-profile) u10) u0 (unwrap! (safe-sub (get reputation-score provider-profile) u10) err-underflow))
           })
         )
         
         ;; Stake goes to insurance pool
-        (var-set insurance-pool (+ (var-get insurance-pool) (get stake-amount stake-position)))
+        (var-set insurance-pool (unwrap! (safe-add (var-get insurance-pool) (get stake-amount stake-position)) err-overflow))
         
         (ok "prediction-failed")
       )
@@ -372,7 +455,7 @@
         claimant: tx-sender,
         claim-reason: claim-reason,
         claim-status: "pending",
-        claim-block: u0,
+        claim-block: burn-block-height,
         resolution-block: none
       }
     )
@@ -403,14 +486,14 @@
                            (get claimant claim-info))))
         
         ;; Update insurance pool
-        (var-set insurance-pool (- (var-get insurance-pool) (get claim-amount claim-info)))
+        (var-set insurance-pool (unwrap! (safe-sub (var-get insurance-pool) (get claim-amount claim-info)) err-underflow))
         
         ;; Update claim status
         (map-set insurance-claims
           { contract-id: contract-id }
           (merge claim-info {
             claim-status: "approved",
-            resolution-block: (some u0)
+            resolution-block: (some burn-block-height)
           })
         )
         
@@ -422,7 +505,7 @@
           { contract-id: contract-id }
           (merge claim-info {
             claim-status: "denied",
-            resolution-block: (some u0)
+            resolution-block: (some burn-block-height)
           })
         )
         
@@ -484,6 +567,19 @@
 
 (define-read-only (get-fix-token-balance (user principal))
   (ft-get-balance fix-token user)
+)
+
+;; NEW: Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (get-operations-count (user principal) (block uint))
+  (default-to u0 (map-get? operations-per-block {user: user, block: block}))
 )
 
 ;; private functions
