@@ -46,6 +46,9 @@
 (define-constant RATE-LIMIT-BLOCKS u10)
 (define-constant MAX-OPERATIONS-PER-BLOCK u5)
 
+;; Emergency mode constants
+(define-constant EMERGENCY_MODE_DURATION u1440) ;; 10 days in blocks
+
 ;; data vars
 (define-data-var next-equipment-id uint u1)
 (define-data-var next-contract-id uint u1)
@@ -54,6 +57,15 @@
 (define-data-var platform-treasury uint u0)
 (define-data-var insurance-pool uint u0)
 (define-data-var contract-paused bool false)
+
+;; Emergency mode variables
+(define-data-var emergency-mode bool false)
+(define-data-var emergency-mode-start uint u0)
+(define-data-var reentrancy-guard bool false)
+
+;; Treasury timelock variables
+(define-data-var pending-treasury principal contract-owner)
+(define-data-var treasury-timelock uint u0)
 
 ;; data maps
 (define-map equipment-registry
@@ -186,6 +198,63 @@
   )
 )
 
+;; Reentrancy protection
+(define-private (non-reentrant)
+  (begin
+    (asserts! (not (var-get reentrancy-guard)) err-unauthorized)
+    (var-set reentrancy-guard true)
+    (ok true)
+  )
+)
+
+(define-private (release-reentrancy-guard)
+  (var-set reentrancy-guard false)
+)
+
+;; Emergency mode functions
+(define-private (check-emergency-mode)
+  (if (var-get emergency-mode)
+    (if (> (- burn-block-height (var-get emergency-mode-start)) EMERGENCY_MODE_DURATION)
+      (begin
+        (var-set emergency-mode false)
+        (var-set emergency-mode-start u0)
+        (ok true)
+      )
+      err-contract-paused
+    )
+    (ok true)
+  )
+)
+
+;; Enhanced input validation
+(define-private (validate-equipment-type (equipment-type (string-ascii 50)))
+  (if (and (> (len equipment-type) u0) (<= (len equipment-type) u50))
+    (ok true)
+    err-invalid-input
+  )
+)
+
+(define-private (validate-sensor-id (sensor-id (string-ascii 64)))
+  (if (and (> (len sensor-id) u0) (<= (len sensor-id) u64))
+    (ok true)
+    err-invalid-input
+  )
+)
+
+(define-private (validate-company-name (name (string-ascii 100)))
+  (if (and (> (len name) u0) (<= (len name) u100))
+    (ok true)
+    err-invalid-input
+  )
+)
+
+(define-private (validate-stake-amount (amount uint))
+  (if (>= amount min-stake-amount)
+    (ok true)
+    err-invalid-stake
+  )
+)
+
 ;; public functions
 
 ;; Pause/unpause contract (owner only)
@@ -205,17 +274,63 @@
   )
 )
 
+;; Emergency mode functions (owner only)
+(define-public (enable-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-mode true)
+    (var-set emergency-mode-start burn-block-height)
+    (var-set contract-paused true) ;; Also pause contract during emergency
+    (ok true)
+  )
+)
+
+(define-public (disable-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-mode false)
+    (var-set emergency-mode-start u0)
+    (var-set contract-paused false) ;; Resume normal operations
+    (ok true)
+  )
+)
+
+;; Treasury management with timelock
+(define-public (set-platform-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (is-eq new-treasury contract-owner)) err-invalid-input) ;; Prevent setting to current owner
+    (var-set pending-treasury new-treasury)
+    (var-set treasury-timelock (+ burn-block-height u1440)) ;; 10-day timelock
+    (ok true)
+  )
+)
+
+(define-public (execute-treasury-change)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (>= burn-block-height (var-get treasury-timelock)) err-unauthorized)
+    (asserts! (> (var-get treasury-timelock) u0) err-unauthorized)
+    ;; Treasury change approved - in production this would update an external registry
+    ;; For now, we just reset the timelock
+    (var-set treasury-timelock u0)
+    (var-set pending-treasury contract-owner)
+    (ok true)
+  )
+)
+
 (define-public (register-equipment (equipment-type (string-ascii 50)) 
                                  (location (string-ascii 100))
                                  (iot-sensor-id (string-ascii 64)))
   (let (
     (equipment-id (var-get next-equipment-id))
   )
-    ;; Security checks
+    ;; Enhanced security checks
+    (try! (check-emergency-mode))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
     (try! (check-rate-limit tx-sender))
-    (asserts! (> (len equipment-type) u0) err-invalid-input)
-    (asserts! (> (len iot-sensor-id) u0) err-invalid-input)
+    (try! (validate-equipment-type equipment-type))
+    (try! (validate-sensor-id iot-sensor-id))
     
     (try! (nft-mint? equipment-nft equipment-id tx-sender))
     
@@ -244,10 +359,12 @@
   (let (
     (existing-profile (map-get? provider-profiles { provider: tx-sender }))
   )
+    ;; Enhanced security checks
+    (try! (check-emergency-mode))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
     (try! (check-rate-limit tx-sender))
     (asserts! (is-none existing-profile) err-already-exists)
-    (asserts! (> (len company-name) u0) err-invalid-input)
+    (try! (validate-company-name company-name))
     
     (map-set provider-profiles
       { provider: tx-sender }
@@ -280,10 +397,13 @@
     (platform-fee (/ (unwrap! (safe-mul contract-value platform-fee-rate) err-overflow) u100))
     (total-required (unwrap! (safe-add (unwrap! (safe-add stake-amount insurance-fee) err-overflow) platform-fee) err-overflow))
   )
+    ;; Enhanced security checks
+    (try! (check-emergency-mode))
     (asserts! (not (var-get contract-paused)) err-contract-paused)
+    (try! (non-reentrant))
     (try! (check-rate-limit tx-sender))
     (asserts! (get is-active equipment-info) err-invalid-input)
-    (asserts! (>= stake-amount min-stake-amount) err-invalid-stake)
+    (try! (validate-stake-amount stake-amount))
     (asserts! (> predicted-failure-block burn-block-height) err-invalid-input)
     (asserts! (<= predicted-failure-block (unwrap! (safe-add burn-block-height u10080) err-overflow)) err-invalid-input) ;; Max 1 week ahead
     (asserts! (>= (ft-get-balance fix-token tx-sender) total-required) err-insufficient-funds)
@@ -338,6 +458,9 @@
     
     (var-set next-contract-id (unwrap! (safe-add contract-id u1) err-overflow))
     (var-set total-predictions-made (unwrap! (safe-add (var-get total-predictions-made) u1) err-overflow))
+    
+    ;; Release reentrancy guard
+    (release-reentrancy-guard)
     
     (ok contract-id)
   )
@@ -525,6 +648,27 @@
 
 ;; read only functions
 
+;; Security status functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (is-emergency-mode)
+  (var-get emergency-mode)
+)
+
+(define-read-only (get-emergency-mode-start)
+  (var-get emergency-mode-start)
+)
+
+(define-read-only (get-treasury-timelock)
+  (var-get treasury-timelock)
+)
+
+(define-read-only (get-pending-treasury)
+  (var-get pending-treasury)
+)
+
 (define-read-only (get-equipment-info (equipment-id uint))
   (map-get? equipment-registry { equipment-id: equipment-id })
 )
@@ -549,7 +693,10 @@
     total-equipment: (var-get total-equipment-registered),
     total-predictions: (var-get total-predictions-made),
     insurance-pool-size: (var-get insurance-pool),
-    platform-treasury: (var-get platform-treasury)
+    platform-treasury: (var-get platform-treasury),
+    contract-paused: (var-get contract-paused),
+    emergency-mode: (var-get emergency-mode),
+    emergency-mode-start: (var-get emergency-mode-start)
   }
 )
 
@@ -567,11 +714,6 @@
 
 (define-read-only (get-fix-token-balance (user principal))
   (ft-get-balance fix-token user)
-)
-
-;; NEW: Security read-only functions
-(define-read-only (is-contract-paused)
-  (var-get contract-paused)
 )
 
 (define-read-only (get-last-operation-block (user principal))
